@@ -55,10 +55,15 @@ class CardStore:
 
     def __init__(self, ranks: dict[int, str] | None = None,
                  protected: set[int] | None = None,
-                 tracker: MarketTracker | None = None):
+                 tracker: MarketTracker | None = None,
+                 price_min_samples: int = 1):
         self._rank: dict[int, str] = dict(ranks or {})
         self._protected: set[int] = set(protected or set())
         self.tracker = tracker or MarketTracker()
+        # Минимум образцов рынка, чтобы доверять опорной цене (1 = как раньше).
+        # Подними для осторожности к дорогим картам: цена, собранная с 1 лота,
+        # ненадёжна — лучше вернуть None и получить fail-closed SKIP.
+        self.price_min_samples = price_min_samples
 
     def set_rank(self, card_id: int, rank: str) -> None:
         self._rank[card_id] = rank
@@ -79,7 +84,7 @@ class CardStore:
         return CardInfo(
             card_id=card_id,
             rank=self._rank.get(card_id),
-            price=self.tracker.reference_price(card_id),
+            price=self.tracker.reference_price(card_id, self.price_min_samples),
             want_count=rep["want_count"],
             lot_count=rep["active_lots"] or None,
             request_count=rep["request_count"],

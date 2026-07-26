@@ -76,6 +76,26 @@ def rank_weight(info: CardInfo, rules: Rules) -> float | None:
     return None
 
 
+def required_ratio(trade: Trade, get_info: CardInfoProvider, rules: Rules) -> float:
+    """Требуемый коэффициент выгоды для ЭТОГО обмена.
+
+    У каждой отдаваемой карты свой требуемый порог: индивидуальный из
+    rules.min_gain_ratio_by_rank для её ранга, иначе глобальный min_gain_ratio.
+    К обмену применяем САМЫЙ строгий из них (максимум): корзина из одного мусора
+    может быть мягче, но как только в отдаче есть ценный ранг — действует его
+    повышенное требование. Нет карт/рангов — глобальный порог.
+    """
+    per_rank = getattr(rules, "min_gain_ratio_by_rank", None) or {}
+    ratios: list[float] = []
+    for c in trade.give:
+        rank = get_info(c.card_id).rank
+        if rank is not None:
+            ratios.append(per_rank.get(rank, rules.min_gain_ratio))
+        else:
+            ratios.append(rules.min_gain_ratio)
+    return max(ratios) if ratios else rules.min_gain_ratio
+
+
 def evaluate_trade(
     trade: Trade,
     get_info: CardInfoProvider,
@@ -98,6 +118,7 @@ def evaluate_trade(
 
     # 3. Жёсткие защиты по отдаваемым картам (рыночная цена/ПП — только тут, как вето)
     given_value = 0.0
+    max_given = 0.0          # вес самой ценной отдаваемой карты (для анти-разбавления)
     for c in trade.give:
         info = get_info(c.card_id)
         label = f"карта {c.card_id} ({info.name or '?'}, ранг {info.rank or '?'})"
@@ -112,6 +133,19 @@ def evaluate_trade(
         if info.rank is not None and info.rank in rules.protected_ranks:
             ev.verdict = Verdict.REJECT
             ev.add(f"{label}: ранг {info.rank} защищён от автоотдачи. REJECT.")
+            return ev
+        # 3b2. косметика экземпляра — тоже ценность. Красивый (палиндромный) номер
+        #      или ранняя копия (низкий номер) не отдаём на автомате.
+        if getattr(rules, "protect_palindrome", False) and c.palindrome:
+            ev.verdict = Verdict.REJECT
+            ev.add(f"{label}: палиндромный номер экземпляра — красивая копия, "
+                   f"не отдаём. REJECT.")
+            return ev
+        low_n = getattr(rules, "protect_copy_number_below", 0)
+        if low_n and c.copy_number is not None and c.copy_number <= low_n:
+            ev.verdict = Verdict.REJECT
+            ev.add(f"{label}: ранняя копия (экз. {c.copy_number} <= {low_n}) — "
+                   f"ценная, не отдаём. REJECT.")
             return ev
         # 3c. для оценки размена нужна ценность ранга (иначе не знаю, что отдаю)
         w = rank_weight(info, rules)
@@ -143,9 +177,11 @@ def evaluate_trade(
                    f"лоты={info.lot_count}, заявки={info.request_count}. REJECT.")
             return ev
         given_value += w
+        max_given = max(max_given, w)
 
     # 4 + 5. Получаемое и правило ранга (справедливость — по весу ранга)
     received_value = 0.0
+    max_received = 0.0       # вес самой ценной получаемой карты (для анти-разбавления)
     for c in trade.receive:
         info = get_info(c.card_id)
         w = rank_weight(info, rules)
@@ -154,18 +190,32 @@ def evaluate_trade(
             ev.add(f"Неизвестен ранг получаемой карты {c.card_id} — не могу оценить размен. SKIP.")
             return ev
         received_value += w
+        max_received = max(max_received, w)
 
     ev.received_value = received_value
     ev.given_value = given_value
     ev.gain_ratio = (received_value / given_value) if given_value > 0 else None
 
-    need = given_value * rules.min_gain_ratio
+    # 5a. Анти-разбавление корзины: самая ценная отдаваемая карта должна быть
+    #     покрыта полученной картой сопоставимого веса. Ловит «слил ценную карту
+    #     в куче мусора»: сумма проходит, а по составу ты теряешь дорогое.
+    guard = getattr(rules, "basket_guard_ratio", 0.0)
+    if guard > 0 and max_given > 0 and max_received < max_given * guard:
+        ev.verdict = Verdict.REJECT
+        ev.add(f"Анти-разбавление: лучшая отдаваемая карта (вес {max_given:.0f}) "
+               f"не покрыта равноценной полученной (макс. вес {max_received:.0f} < "
+               f"{max_given * guard:.0f}). Возможен слив ценной карты в корзине. REJECT.")
+        return ev
+
+    # 5b. Правило выгоды с учётом per-rank порогов (строже — для ценных отдаваемых).
+    ratio = required_ratio(trade, get_info, rules)
+    need = given_value * ratio
     if received_value >= need:
         ev.verdict = Verdict.ACCEPT
         ev.add(f"Выгодно по рангу: беру вес {received_value:.0f} за {given_value:.0f} "
-               f"(x{ev.gain_ratio:.2f} >= x{rules.min_gain_ratio}). ACCEPT.")
+               f"(x{ev.gain_ratio:.2f} >= x{ratio}). ACCEPT.")
     else:
         ev.verdict = Verdict.REJECT
         ev.add(f"Невыгодно: вес {received_value:.0f}, нужно >= {need:.0f} "
-               f"(x{rules.min_gain_ratio}). REJECT.")
+               f"(x{ratio}). REJECT.")
     return ev

@@ -168,3 +168,117 @@ def test_unknown_received_card_is_skip():
 def test_is_popular_by_requests():
     assert is_popular(CardInfo(1, request_count=50), RULES) is True
     assert is_popular(CardInfo(1, want_count=1, lot_count=100), RULES) is False
+
+
+# --- per-rank пороги выгоды ---
+
+def test_per_rank_ratio_stricter_for_given_rank_rejects():
+    # Отдаём A: для A задан строгий порог x3. Размен 2×A за 1×A = x2 < x3 -> REJECT.
+    rules = Rules(min_gain_ratio_by_rank={"A": 3.0})
+    db = {
+        1: CardInfo(1, rank="A"), 2: CardInfo(2, rank="A"),
+        3: CardInfo(3, rank="A", price=5.0),
+    }
+    ev = evaluate_trade(make_trade([1, 2], [3]), provider(db), rules)
+    assert ev.verdict == Verdict.REJECT
+    assert any("x3" in r for r in ev.reasons)
+
+
+def test_per_rank_ratio_met_accepts():
+    # Тот же строгий A x3, но получаем 3×A за 1×A = x3 -> ACCEPT.
+    rules = Rules(min_gain_ratio_by_rank={"A": 3.0})
+    db = {
+        1: CardInfo(1, rank="A"), 2: CardInfo(2, rank="A"), 3: CardInfo(3, rank="A"),
+        4: CardInfo(4, rank="A", price=5.0),
+    }
+    ev = evaluate_trade(make_trade([1, 2, 3], [4]), provider(db), rules)
+    assert ev.verdict == Verdict.ACCEPT
+
+
+def test_per_rank_ratio_softer_for_cheap_rank():
+    # Мусор E с мягким порогом x1.5: 3×E за 2×E = x1.5 -> ACCEPT (при глобальном x2 было бы REJECT).
+    rules = Rules(min_gain_ratio_by_rank={"E": 1.5})
+    db = {i: CardInfo(i, rank="E", price=1.0) for i in range(1, 6)}
+    ev = evaluate_trade(make_trade([1, 2, 3], [4, 5]), provider(db), rules)
+    assert ev.verdict == Verdict.ACCEPT
+
+
+# --- анти-разбавление корзины ---
+
+def test_basket_guard_blocks_valuable_card_diluted_in_junk():
+    # Отдаю 1×B (вес 8) + 1×E, получаю кучу E. Сумма прошла бы порог, но лучшая
+    # отдаваемая карта (B) не покрыта равноценной полученной -> REJECT.
+    db = {2: CardInfo(2, rank="B", price=5.0), 3: CardInfo(3, rank="E", price=1.0)}
+    for i in range(100, 120):
+        db[i] = CardInfo(i, rank="E", price=1.0)
+    recv = list(range(100, 120))   # 20×E = вес 20
+    ev = evaluate_trade(make_trade(recv, [2, 3]), provider(db), RULES)
+    assert ev.verdict == Verdict.REJECT
+    assert any("разбавл" in r.lower() for r in ev.reasons)
+
+
+def test_basket_guard_allows_when_received_covers_best_given():
+    # Отдаю 2×E, получаю 1×B — лучшая полученная (B, вес 8) покрывает лучшую
+    # отдаваемую (E, вес 1). Проходит и анти-разбавление, и выгоду.
+    db = {
+        1: CardInfo(1, rank="B", price=5.0),
+        2: CardInfo(2, rank="E", price=1.0), 3: CardInfo(3, rank="E", price=1.0),
+    }
+    ev = evaluate_trade(make_trade([1], [2, 3]), provider(db), RULES)
+    assert ev.verdict == Verdict.ACCEPT
+
+
+def test_basket_guard_can_be_disabled():
+    # При basket_guard_ratio=0 старое поведение: 1×B + мусор за гору E проходит по сумме.
+    rules = Rules(basket_guard_ratio=0.0)
+    db = {2: CardInfo(2, rank="B", price=5.0), 3: CardInfo(3, rank="E", price=1.0)}
+    for i in range(100, 120):
+        db[i] = CardInfo(i, rank="E", price=1.0)
+    recv = list(range(100, 120))
+    ev = evaluate_trade(make_trade(recv, [2, 3]), provider(db), rules)
+    assert ev.verdict == Verdict.ACCEPT
+
+
+# --- защита косметики экземпляра ---
+
+def test_palindrome_given_is_reject():
+    # Отдаём карту с палиндромным номером -> REJECT, даже если размен выгоден.
+    db = {1: CardInfo(1, rank="B", price=5.0), 2: CardInfo(2, rank="E", price=1.0)}
+    trade = Trade(
+        trade_id=1, partner_id=2, partner_name="X",
+        receive=(CardRef(1),),
+        give=(CardRef(2, copy_number=131, palindrome=True),),
+        stated_receive=1, stated_give=1,
+    )
+    ev = evaluate_trade(trade, provider(db), RULES)
+    assert ev.verdict == Verdict.REJECT
+    assert any("палиндром" in r.lower() for r in ev.reasons)
+
+
+def test_low_copy_number_given_is_reject_when_enabled():
+    # Первые копии беречь: с protect_copy_number_below=3 экз. 2 не отдаём.
+    rules = Rules(protect_copy_number_below=3)
+    db = {1: CardInfo(1, rank="B", price=5.0), 2: CardInfo(2, rank="E", price=1.0)}
+    trade = Trade(
+        trade_id=1, partner_id=2, partner_name="X",
+        receive=(CardRef(1),),
+        give=(CardRef(2, copy_number=2),),
+        stated_receive=1, stated_give=1,
+    )
+    ev = evaluate_trade(trade, provider(db), rules)
+    assert ev.verdict == Verdict.REJECT
+    assert any("ранняя копия" in r.lower() for r in ev.reasons)
+
+
+def test_palindrome_protection_off_by_config():
+    # protect_palindrome=False -> палиндром больше не блокирует (проходит по выгоде).
+    rules = Rules(protect_palindrome=False)
+    db = {1: CardInfo(1, rank="B", price=5.0), 2: CardInfo(2, rank="E", price=1.0)}
+    trade = Trade(
+        trade_id=1, partner_id=2, partner_name="X",
+        receive=(CardRef(1),),
+        give=(CardRef(2, copy_number=131, palindrome=True),),
+        stated_receive=1, stated_give=1,
+    )
+    ev = evaluate_trade(trade, provider(db), rules)
+    assert ev.verdict == Verdict.ACCEPT

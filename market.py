@@ -204,10 +204,18 @@ class MarketTracker:
             "request_count": last_snap[1] if last_snap else None,
         }
 
-    def reference_price(self, card_id: int) -> float | None:
-        """Опорная цена для оценки обмена: медиана активных S-лотов,
-        иначе средняя цена продаж. None = данных нет (движок сделает SKIP)."""
+    def reference_price(self, card_id: int, min_samples: int = 1) -> float | None:
+        """Опорная цена для оценки обмена: медиана активных S-лотов, иначе средняя
+        цена продаж. None = данных недостаточно (движок сделает fail-closed SKIP).
+
+        min_samples — минимум точек данных, чтобы вообще ДОВЕРЯТЬ цене. Один
+        случайный лот легко перекошен (демпинг/накрутка), поэтому для ценных
+        рангов имеет смысл поднять порог: цена вернётся только когда активных
+        лотов (или продаж) не меньше min_samples. min_samples=1 = как раньше.
+        """
         r = self.price_report(card_id)
-        if r["active_median"] is not None:
+        if r["active_median"] is not None and r["active_lots"] >= min_samples:
             return r["active_median"]
-        return r["sold_avg"]
+        if r["sold_avg"] is not None and r["sold_count"] >= min_samples:
+            return r["sold_avg"]
+        return None
