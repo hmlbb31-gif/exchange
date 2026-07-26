@@ -1,8 +1,72 @@
-# pytest cache directory #
+# MangaBuff авто-обменник
 
-This directory contains data from the pytest's cache plugin,
-which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+Telegram-бот, который автоматически рассматривает входящие обмены на mangabuff.ru
+и принимает только выгодные и безопасные по строгим (fail-closed) правилам.
+Работает на твоих собственных аккаунтах («твинках»); кука берётся из `.env` или
+`cookies.txt`.
 
-**Do not** commit this to version control.
+## Структура
 
-See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+```
+.
+├── bot.py              — запуск Telegram-бота:  python bot.py
+├── run_dry.py          — сухой прогон без Telegram (диагностика решений)
+├── crawl_ranks.py      — сбор/обновление базы рангов (--refresh)
+├── dump_trades.py      — дамп страницы обменов для отладки парсера
+├── config.py           — настройки и пороги (класс Rules)
+├── mb/                 — ядро пакета
+│   ├── client.py       — HTTP-клиент (сессия, прокси, детект «протух логин»)
+│   ├── parser.py       — разбор HTML обменов
+│   ├── decision.py     — движок правил (fail-closed)
+│   ├── market.py       — трекер рынка и опорные цены
+│   ├── cards.py        — база рангов + провайдер CardInfo
+│   ├── trader.py       — оркестрация одной итерации обмена
+│   ├── worker.py       — цикл опроса и фоновые задачи
+│   ├── storage.py      — SQLite (обмены, аккаунты, куки)
+│   ├── cookies.py      — загрузка cookie из .env/cookies.txt
+│   ├── models.py       — датаклассы предметной области
+│   ├── history.py      — разбор истории обменов
+│   └── farm.py         — задачи фарма
+├── tests/              — pytest-тесты
+├── data/               — card_ranks.json + БД trade.sqlite3 (создаётся)
+├── requirements.txt    — ядро (httpx)
+└── requirements-bot.txt— + aiogram, cryptography (нужен Python 3.12/3.13)
+```
+
+## Установка и запуск
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-bot.txt
+cp .env.example .env      # впиши TELEGRAM_TOKEN, ADMIN_ID, cookie
+python bot.py
+```
+
+Сухой прогон логики без Telegram:
+
+```bash
+python run_dry.py
+```
+
+## Тесты
+
+```bash
+pip install pytest pytest-asyncio httpx
+pytest
+```
+
+## Правила решений (кратко)
+
+Движок `mb/decision.py` работает по принципу **fail-closed**: любая неопределённость
+(неизвестный ранг, нет рыночных данных для дорогой карты) ведёт к отказу/пропуску,
+а не к риску. Ключевые настройки в `config.py → Rules`:
+
+- `min_gain_ratio` — базовый минимальный выигрыш (по умолчанию x2).
+- `min_gain_ratio_by_rank` — индивидуальные пороги по рангу отдаваемой карты
+  (ценные ранги — строже).
+- `basket_guard_ratio` — анти-разбавление: лучшая отдаваемая карта должна быть
+  покрыта равноценной полученной (защита от «слил ценную карту в куче мусора»).
+- `protect_palindrome` / `protect_copy_number_below` — беречь «красивые» номера
+  экземпляров и ранние копии.
+- `protected_cards` / `protected_ranks` — белые списки, которые никогда не отдаём.
+```

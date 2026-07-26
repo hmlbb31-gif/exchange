@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Корень проекта на sys.path, чтобы резолвились и пакет `mb`, и top-level `config`.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

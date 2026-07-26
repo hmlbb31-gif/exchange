@@ -5,17 +5,8 @@ from pathlib import Path
 
 from mb.cards import CardStore, load_rank_db
 
-# Сид-база рангов. В классической раскладке лежит в exchange/data/, в этом
-# (флэттенизированном) репозитории — рядом с модулями в корне. Берём тот путь,
-# который реально существует, чтобы тест не зависел от структуры каталогов.
-_ROOT = Path(__file__).parent
-DB = next(
-    (p for p in (_ROOT / "data" / "card_ranks.json",
-                 _ROOT.parent / "data" / "card_ranks.json",
-                 _ROOT / "card_ranks.json")
-     if p.exists()),
-    _ROOT / "card_ranks.json",
-)
+# Сид-база рангов лежит в data/ в корне проекта (tests/ — на уровень ниже).
+DB = Path(__file__).resolve().parent.parent / "data" / "card_ranks.json"
 
 
 def test_load_rank_db_inverts_and_skips_meta(tmp_path):
