@@ -46,6 +46,29 @@ log = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RANK_DB = DATA_DIR / "card_ranks.json"
 
+# Числовые правила, которые можно править из ТГ: имя поля Rules -> преобразователь.
+RULE_FIELDS: dict[str, type] = {
+    "min_gain_ratio": float,
+    "basket_guard_ratio": float,
+    "protect_copy_number_below": int,
+    "expensive_price": float,
+    "strict_expensive_price": float,
+    "pp_want_threshold": int,
+    "pp_low_supply_lots": int,
+    "pp_request_threshold": int,
+}
+# Человекочитаемые подписи для меню правил.
+RULE_LABELS: dict[str, str] = {
+    "min_gain_ratio": "Выгода ×",
+    "basket_guard_ratio": "Анти-разбавление ×",
+    "protect_copy_number_below": "Беречь копии ≤",
+    "expensive_price": "Порог «дорогая»",
+    "strict_expensive_price": "Порог strict",
+    "pp_want_threshold": "ПП: Хочу ≥",
+    "pp_low_supply_lots": "ПП: лоты ≤",
+    "pp_request_threshold": "ПП: заявки ≥",
+}
+
 
 class ExchangeApp:
     def __init__(self):
@@ -73,9 +96,55 @@ class ExchangeApp:
         self.loop: TradeLoop | None = None
         self.bot: Bot | None = None
         self.worker_task: asyncio.Task | None = None
-        # user_id -> ждём от него строку cookie следующим сообщением
-        self.awaiting: set[int] = set()
+        # user_id -> что ждём от него следующим сообщением:
+        #   "cookie"        — строку cookie
+        #   "ua"            — новый User-Agent
+        #   "wl_add"        — id карт(ы) для защиты
+        #   "wl_del"        — id карт(ы) снять с защиты
+        #   f"rule:<name>"  — новое значение правила
+        self.awaiting: dict[int, str] = {}
         self._ranks = len(ranks)
+
+        self._load_settings()
+
+    # --- персистентные настройки (переживают рестарт) ---
+    def _load_settings(self) -> None:
+        s = self.store.all_settings()
+        if "dry_run" in s:
+            self.cfg.dry_run = s["dry_run"] == "1"
+        if s.get("user_agent"):
+            self.cfg.user_agent = s["user_agent"]
+        if "protect_palindrome" in s:
+            self.rules.protect_palindrome = s["protect_palindrome"] == "1"
+        # числовые правила
+        for key, cast in RULE_FIELDS.items():
+            if key in s:
+                try:
+                    setattr(self.rules, key, cast(s[key]))
+                except (ValueError, TypeError):
+                    pass
+
+    def set_dry_run(self, value: bool) -> None:
+        self.cfg.dry_run = value
+        self.store.set_setting("dry_run", "1" if value else "0")
+
+    def set_user_agent(self, ua: str) -> None:
+        self.cfg.user_agent = ua
+        self.store.set_setting("user_agent", ua)
+        # обновим UA и у сохранённого trade-аккаунта
+        for a in self.store.list_accounts(role=ROLE_TRADE):
+            self.store.db.execute("UPDATE accounts SET user_agent=? WHERE id=?",
+                                  (ua, a.id))
+        self.store.db.commit()
+
+    def set_rule(self, name: str, raw: str) -> None:
+        cast = RULE_FIELDS[name]
+        setattr(self.rules, name, cast(raw))
+        self.store.set_setting(name, str(getattr(self.rules, name)))
+
+    def reload_protected(self) -> None:
+        """Пересобрать whitelist в CardStore из БД (после add/remove)."""
+        self.cards._protected = self.store.protected_ids()
 
     @property
     def linked(self) -> bool:
@@ -128,10 +197,16 @@ def main_kb(app: ExchangeApp) -> InlineKeyboardMarkup:
         rows.append([_btn("⏸ Выключить обмен", "trade_off")])
     else:
         rows.append([_btn("▶️ Включить обмен", "trade_on")])
+    # Переключатель режима сразу в меню, чтобы видеть текущий и менять одним тапом.
+    if app.cfg.dry_run:
+        rows.append([_btn("🧪 Режим: СУХОЙ → включить LIVE", "mode_live")])
+    else:
+        rows.append([_btn("🟢 Режим: LIVE → вернуть сухой", "mode_dry")])
     rows.append([_btn("🔁 Обновить куку" if app.linked else "🔗 Привязать аккаунт",
                       "link")])
     rows.append([_btn("🔄 Один проход", "run"), _btn("📊 Статус", "status")])
-    rows.append([_btn("⚙️ Правила", "rules"), _btn("📈 Статистика", "stats")])
+    rows.append([_btn("⚙️ Правила", "rules"), _btn("🛡 Whitelist", "wl")])
+    rows.append([_btn("🕵️ User-Agent", "ua"), _btn("📈 Статистика", "stats")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -194,6 +269,64 @@ def stats_text(app: ExchangeApp) -> str:
     return f"📈 <b>Статистика решений</b>\n\n{body}"
 
 
+# --- Экран редактирования правил ---
+
+def rules_edit_kb(app: ExchangeApp) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for name, label in RULE_LABELS.items():
+        val = getattr(app.rules, name)
+        rows.append([_btn(f"{label}: {val}", f"editrule:{name}")])
+    # булев тумблер палиндромов
+    pal = "вкл" if app.rules.protect_palindrome else "выкл"
+    rows.append([_btn(f"Защита палиндромов: {pal}", "toggle_palindrome")])
+    rows.append([_btn("⬅️ В меню", "menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def rule_prompt(name: str, app: ExchangeApp) -> str:
+    return (
+        f"✏️ <b>{RULE_LABELS[name]}</b>\n\n"
+        f"Текущее значение: <b>{getattr(app.rules, name)}</b>\n\n"
+        "Пришли новое число одним сообщением."
+    )
+
+
+# --- Экран whitelist ---
+
+def wl_text(app: ExchangeApp) -> str:
+    ids = sorted(app.cards._protected)
+    shown = ", ".join(str(i) for i in ids[:50]) or "пусто"
+    more = f"\n…и ещё {len(ids) - 50}" if len(ids) > 50 else ""
+    return (
+        "🛡 <b>Защищённые карты (whitelist)</b>\n\n"
+        "Эти карты НИКОГДА не отдаются автоматически.\n\n"
+        f"Всего: <b>{len(ids)}</b>\n{shown}{more}"
+    )
+
+
+def wl_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("➕ Добавить карты", "wl_add"), _btn("➖ Убрать карты", "wl_del")],
+        [_btn("⬅️ В меню", "menu")],
+    ])
+
+
+def ua_text(app: ExchangeApp) -> str:
+    return (
+        "🕵️ <b>User-Agent</b>\n\n"
+        "Cookie MangaBuff привязан к UA браузера, из которого экспортирован — "
+        "он <b>должен совпадать</b>, иначе DDoS-Guard сбросит сессию.\n\n"
+        f"Сейчас:\n<code>{app.cfg.user_agent}</code>"
+    )
+
+
+def ua_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✏️ Изменить UA", "ua_set")],
+        [_btn("⬅️ В меню", "menu")],
+    ])
+
+
 LINK_PROMPT = (
     "🔗 <b>Привязка аккаунта</b>\n\n"
     "Пришли <b>одним сообщением</b> строку cookie от mangabuff.ru "
@@ -206,6 +339,15 @@ LINK_PROMPT = (
 
 
 # ------------------------- Логика куки -------------------------
+
+def _parse_ids(text: str) -> list[int]:
+    """Вытащить целочисленные id карт из свободного текста (пробелы/запятые)."""
+    out: list[int] = []
+    for tok in (text or "").replace(",", " ").split():
+        if tok.isdigit():
+            out.append(int(tok))
+    return out
+
 
 def normalize_pasted_cookie(text: str) -> str:
     text = (text or "").strip()
@@ -260,14 +402,14 @@ def build_dispatcher(app: ExchangeApp) -> Dispatcher:
     async def _start(msg: Message):
         if not ok_msg(msg):
             return
-        app.awaiting.discard(msg.from_user.id)
+        app.awaiting.pop(msg.from_user.id, None)
         await show_menu(msg)
 
     @dp.callback_query(F.data == "menu")
     async def _menu(cb: CallbackQuery):
         if not ok_cb(cb):
             return await cb.answer()
-        app.awaiting.discard(cb.from_user.id)
+        app.awaiting.pop(cb.from_user.id, None)
         await show_menu(cb)
         await cb.answer()
 
@@ -282,7 +424,80 @@ def build_dispatcher(app: ExchangeApp) -> Dispatcher:
     async def _rules(cb: CallbackQuery):
         if not ok_cb(cb):
             return await cb.answer()
-        await cb.message.edit_text(rules_text(app), reply_markup=back_kb())
+        await cb.message.edit_text(rules_text(app) + "\n\n👇 Нажми поле, чтобы изменить",
+                                   reply_markup=rules_edit_kb(app))
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("editrule:"))
+    async def _edit_rule(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        name = cb.data.split(":", 1)[1]
+        if name not in RULE_FIELDS:
+            return await cb.answer("Неизвестное правило", show_alert=True)
+        app.awaiting[cb.from_user.id] = f"rule:{name}"
+        await cb.message.edit_text(rule_prompt(name, app), reply_markup=cancel_kb())
+        await cb.answer()
+
+    @dp.callback_query(F.data == "toggle_palindrome")
+    async def _toggle_pal(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        app.rules.protect_palindrome = not app.rules.protect_palindrome
+        app.store.set_setting("protect_palindrome",
+                              "1" if app.rules.protect_palindrome else "0")
+        await cb.message.edit_text(rules_text(app) + "\n\n👇 Нажми поле, чтобы изменить",
+                                   reply_markup=rules_edit_kb(app))
+        await cb.answer("Готово.")
+
+    @dp.callback_query(F.data.in_({"mode_live", "mode_dry"}))
+    async def _mode(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        app.set_dry_run(cb.data == "mode_dry")
+        if not app.cfg.dry_run:
+            await cb.answer("⚠️ LIVE включён — обмены будут реально приниматься!",
+                            show_alert=True)
+        else:
+            await cb.answer("Сухой режим: ничего не жмётся.")
+        await show_menu(cb)
+
+    @dp.callback_query(F.data == "wl")
+    async def _wl(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        await cb.message.edit_text(wl_text(app), reply_markup=wl_kb())
+        await cb.answer()
+
+    @dp.callback_query(F.data.in_({"wl_add", "wl_del"}))
+    async def _wl_edit(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        app.awaiting[cb.from_user.id] = cb.data
+        verb = "добавить в защиту" if cb.data == "wl_add" else "снять с защиты"
+        await cb.message.edit_text(
+            f"Пришли id карт(ы), чтобы <b>{verb}</b>.\n"
+            "Можно несколько через пробел или запятую (напр. <code>1234 5678</code>).",
+            reply_markup=cancel_kb())
+        await cb.answer()
+
+    @dp.callback_query(F.data == "ua")
+    async def _ua(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        await cb.message.edit_text(ua_text(app), reply_markup=ua_kb())
+        await cb.answer()
+
+    @dp.callback_query(F.data == "ua_set")
+    async def _ua_set(cb: CallbackQuery):
+        if not ok_cb(cb):
+            return await cb.answer()
+        app.awaiting[cb.from_user.id] = "ua"
+        await cb.message.edit_text(
+            "Пришли новую строку User-Agent одним сообщением.\n"
+            "Скопируй её из того же браузера, где брал cookie "
+            "(DevTools → Network → любой запрос → Request Headers → User-Agent).",
+            reply_markup=cancel_kb())
         await cb.answer()
 
     @dp.callback_query(F.data == "stats")
@@ -336,22 +551,61 @@ def build_dispatcher(app: ExchangeApp) -> Dispatcher:
     async def _link(cb: CallbackQuery):
         if not ok_cb(cb):
             return await cb.answer()
-        app.awaiting.add(cb.from_user.id)
+        app.awaiting[cb.from_user.id] = "cookie"
         await cb.message.edit_text(LINK_PROMPT, reply_markup=cancel_kb())
         await cb.answer()
 
-    # Приём куки: любое текстовое сообщение (не команда) от админа, который в
-    # режиме ожидания. Никаких команд — просто вставил строку и всё.
+    # Единый приём текста от админа в режиме ожидания. Никаких команд — просто
+    # вставил значение и всё. Что именно ждём — хранится в app.awaiting[uid].
     @dp.message(F.text & ~F.text.startswith("/"))
     async def _on_text(msg: Message):
         if not ok_msg(msg):
             return
         uid = msg.from_user.id
-        if uid not in app.awaiting:
-            # Не в режиме привязки — просто показываем меню.
+        kind = app.awaiting.get(uid)
+        if not kind:
             await show_menu(msg)
             return
-        app.awaiting.discard(uid)
+        app.awaiting.pop(uid, None)
+
+        if kind == "cookie":
+            await _handle_cookie(msg)
+        elif kind == "ua":
+            app.set_user_agent(msg.text.strip())
+            await msg.answer("✅ User-Agent обновлён. При смене UA обычно нужно "
+                             "заново привязать cookie из того же браузера.",
+                             reply_markup=main_kb(app))
+        elif kind in ("wl_add", "wl_del"):
+            ids = _parse_ids(msg.text)
+            if not ids:
+                await msg.answer("Не нашёл ни одного id. Попробуй снова.",
+                                 reply_markup=main_kb(app))
+                return
+            for cid in ids:
+                if kind == "wl_add":
+                    app.store.protect(cid, reason="из ТГ")
+                else:
+                    app.store.unprotect(cid)
+            app.reload_protected()
+            verb = "добавлены в защиту" if kind == "wl_add" else "сняты с защиты"
+            await msg.answer(f"✅ {len(ids)} карт(ы) {verb}. "
+                             f"Всего защищено: {len(app.cards._protected)}.",
+                             reply_markup=main_kb(app))
+        elif kind.startswith("rule:"):
+            name = kind.split(":", 1)[1]
+            try:
+                app.set_rule(name, msg.text.strip().replace(",", "."))
+            except (ValueError, TypeError):
+                await msg.answer("Нужно число. Попробуй снова.",
+                                 reply_markup=main_kb(app))
+                return
+            await msg.answer(
+                f"✅ {RULE_LABELS.get(name, name)} = {getattr(app.rules, name)}",
+                reply_markup=rules_edit_kb(app))
+        else:
+            await show_menu(msg)
+
+    async def _handle_cookie(msg: Message):
         cookie = normalize_pasted_cookie(msg.text)
         # Убираем сообщение с кукой из чата (бот может удалять входящие в ЛС).
         try:

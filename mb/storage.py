@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS quiz_answers (
     question    TEXT PRIMARY KEY,
     answer      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 """
 
 
@@ -229,6 +233,19 @@ class Store:
 
     def protected_ids(self) -> set[int]:
         return {r["card_id"] for r in self.db.execute("SELECT card_id FROM protected_cards")}
+
+    # --- настройки (переключатели/пороги, правятся из ТГ) ---
+    def get_setting(self, key: str) -> str | None:
+        r = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)",
+                        (key, str(value)))
+        self.db.commit()
+
+    def all_settings(self) -> dict[str, str]:
+        return {r["key"]: r["value"] for r in self.db.execute("SELECT key, value FROM settings")}
 
     # --- база ответов квиза ---
     def get_quiz_answer(self, question: str) -> str | None:
